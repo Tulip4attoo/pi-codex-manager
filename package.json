@@ -1,0 +1,23 @@
+{
+  "name": "pi-codex-manager",
+  "version": "0.1.0",
+  "description": "Pi extension to manage OpenAI Codex OAuth profiles and service_tier from one /codex command.",
+  "keywords": [
+    "pi-package",
+    "pi-extension",
+    "codex",
+    "openai-codex",
+    "oauth",
+    "service-tier"
+  ],
+  "license": "MIT",
+  "type": "module",
+  "pi": {
+    "extensions": [
+      "./extensions/codex-manager.ts"
+    ]
+  },
+  "peerDependencies": {
+    "@mariozechner/pi-coding-agent": "*"
+  }
+}
