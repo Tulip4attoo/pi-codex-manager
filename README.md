@@ -90,20 +90,20 @@ Profile names can contain letters, numbers, dots, underscores, and dashes, so na
 Set the OpenAI/OpenAI Codex `service_tier` sent with requests:
 
 ```text
-/codex tier priority
-/codex tier flex
-/codex tier default
-/codex tier auto
+/codex tier           # toggle priority on/off
+/codex fast           # same as /codex tier
+/codex tier priority  # fast mode
 /codex tier scale
-/codex tier off
-/codex tier status
+/codex tier off       # do not inject service_tier
 ```
 
-Common options:
+Options:
 
 - `priority` - fast mode
-- `flex` - slower/cheaper where supported
+- `scale` - scale tier where supported
 - `off` - do not inject `service_tier`; use provider/project default
+
+`/codex fast` is a convenience form for `/codex tier`, so it toggles priority mode on/off.
 
 The tier is only injected for providers `openai` and `openai-codex`, and only when the request payload does not already contain `service_tier`.
 

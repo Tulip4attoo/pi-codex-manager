@@ -15,7 +15,7 @@ const PROFILE_DIR = join(AGENT_DIR, "codex-profiles");
 const ACTIVE_PROFILE_PATH = join(PROFILE_DIR, "active");
 const GLOBAL_SETTINGS_PATH = join(AGENT_DIR, "settings.json");
 
-const SERVICE_TIERS = ["auto", "default", "flex", "scale", "priority"] as const;
+const SERVICE_TIERS = ["scale", "priority"] as const;
 type ServiceTier = (typeof SERVICE_TIERS)[number];
 
 type JsonRecord = Record<string, unknown>;
@@ -71,12 +71,6 @@ function tierIcon(tier: ServiceTier): string {
 	switch (tier) {
 		case "priority":
 			return "⚡";
-		case "flex":
-			return "🐢";
-		case "default":
-			return "○";
-		case "auto":
-			return "◇";
 		case "scale":
 			return "▣";
 	}
@@ -280,7 +274,9 @@ function helpText(): string {
 		"  /codex profile switch <name>",
 		"  /codex profile list",
 		"  /codex profile current",
-		"  /codex tier priority|flex|default|auto|scale|off|status",
+		"  /codex tier              # toggle priority on/off",
+		"  /codex fast              # same as /codex tier",
+		"  /codex tier priority|scale|off",
 	].join("\n");
 }
 
@@ -439,25 +435,16 @@ export default function codexManager(pi: ExtensionAPI): void {
 	}
 
 	async function handleTierCommand(tokens: string[], ctx: ExtensionContext): Promise<void> {
-		const arg = tokens[1]?.toLowerCase() ?? "status";
+		const arg = tokens[1]?.toLowerCase();
 
-		if (arg === "status") {
-			notify(ctx, describeTier(ctx), "info");
+		if (!arg) {
+			const priorityIsEnabled = tierState.enabled && tierState.value === "priority";
+			await setTierState(priorityIsEnabled ? { enabled: false } : { enabled: true, value: "priority" }, ctx);
 			return;
 		}
 
-		if (["off", "disable", "disabled", "false", "0"].includes(arg)) {
+		if (arg === "off") {
 			await setTierState({ enabled: false }, ctx);
-			return;
-		}
-
-		if (["on", "enable", "enabled", "true", "1"].includes(arg)) {
-			await setTierState({ enabled: true }, ctx);
-			return;
-		}
-
-		if (arg === "toggle") {
-			await setTierState({ enabled: !tierState.enabled }, ctx);
 			return;
 		}
 
@@ -466,7 +453,7 @@ export default function codexManager(pi: ExtensionAPI): void {
 			return;
 		}
 
-		throw new Error(`Unknown /codex tier argument: ${tokens[1]}. Use priority, flex, default, auto, scale, off, or status.`);
+		throw new Error(`Unknown /codex tier argument: ${tokens[1]}. Use priority, scale, or off.`);
 	}
 
 	function getCodexCompletions(prefix: string): AutocompleteItem[] | null {
@@ -478,14 +465,14 @@ export default function codexManager(pi: ExtensionAPI): void {
 			"profile current",
 			"profile save ",
 			...profileNames.map((name) => `profile switch ${name}`),
+			"tier",
 			"tier priority",
-			"tier flex",
-			"tier default",
-			"tier auto",
 			"tier scale",
 			"tier off",
-			"tier status",
-			"tier toggle",
+			"fast",
+			"fast priority",
+			"fast scale",
+			"fast off",
 		];
 		return completionItems(candidates, prefix);
 	}
@@ -514,6 +501,11 @@ export default function codexManager(pi: ExtensionAPI): void {
 
 			if (command === "tier") {
 				await handleTierCommand(tokens, ctx);
+				return;
+			}
+
+			if (command === "fast") {
+				await handleTierCommand(["tier", ...tokens.slice(1)], ctx);
 				return;
 			}
 
