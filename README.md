@@ -2,13 +2,13 @@
 
 Manage OpenAI Codex accounts and service tier from one pi command: `/codex`.
 
+Switch easily between multiple Codex accounts without logging out, logging back in, and repeating the OAuth flow every time one account hits quota. Save each account once, then jump between them with `/codex profile switch <name>`.
+
 This extension replaces separate Codex helpers such as account switching and fast/service-tier toggling. It intentionally keeps the command space small by registering only `/codex`.
 
 ## Demo
 
-<video src="./codex_manager_0.1.mp4" controls width="100%"></video>
-
-If the video does not render in your viewer, open [`codex_manager_0.1.mp4`](./codex_manager_0.1.mp4) directly.
+![pi-codex-manager demo](./media/codex_manager_0.1.gif)
 
 ## Install from GitHub
 
@@ -30,23 +30,7 @@ Check that it is available:
 
 ### Recommended: disable older Codex extensions
 
-If you previously installed separate extensions, remove or disable them to avoid duplicate commands, status lines, or request hooks:
-
-- `pi-codex-switch`
-- `pi-codex-fast`
-- `pi-codex-service-tier`
-
-For local symlink installs, this is usually:
-
-```bash
-rm ~/.pi/agent/extensions/codex-fast.ts ~/.pi/agent/extensions/codex-switch.ts
-```
-
-Then reload pi:
-
-```text
-/reload
-```
+If you previously installed separate extensions, remove or disable them to avoid duplicate commands, status lines, or request hooks, then reload pi.
 
 ## Usage
 
