@@ -2,6 +2,7 @@ import type { AutocompleteItem } from "@mariozechner/pi-tui";
 import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
+import { createHash } from "node:crypto";
 import { dirname, join } from "node:path";
 import { homedir } from "node:os";
 
@@ -14,6 +15,11 @@ const AGENT_DIR = process.env.PI_CODING_AGENT_DIR ?? join(homedir(), ".pi", "age
 const PROFILE_DIR = join(AGENT_DIR, "codex-profiles");
 const ACTIVE_PROFILE_PATH = join(PROFILE_DIR, "active");
 const GLOBAL_SETTINGS_PATH = join(AGENT_DIR, "settings.json");
+const CODEX_AUTH_PATH = join(homedir(), ".codex", "auth.json");
+const LIVE_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
+const USAGE_CACHE_TTL_MS = 60_000;
+const USAGE_ERROR_CACHE_TTL_MS = 15_000;
+const USAGE_BAR_WIDTH = 8;
 
 const SERVICE_TIERS = ["scale", "priority"] as const;
 type ServiceTier = (typeof SERVICE_TIERS)[number];
@@ -30,6 +36,30 @@ type CodexCredential = JsonRecord & {
 type TierState = {
 	enabled: boolean;
 	value: ServiceTier;
+};
+
+type UsageLimit = {
+	label: string;
+	remainingPercent: number;
+	source: string;
+};
+
+type UsageSummary = {
+	planType?: string;
+	limits: UsageLimit[];
+	fetchedAt: number;
+};
+
+type UsageCacheEntry = {
+	expiresAt: number;
+	summary?: UsageSummary;
+	error?: string;
+	promise?: Promise<UsageSummary>;
+};
+
+type ResolvedUsageToken = {
+	key: string;
+	token: string;
 };
 
 function isRecord(value: unknown): value is JsonRecord {
@@ -65,6 +95,211 @@ function accountLabel(credential: CodexCredential | undefined): string {
 	const accountId = typeof credential?.accountId === "string" ? credential.accountId : undefined;
 	if (!accountId) return "account unknown";
 	return `account …${accountId.slice(-8)}`;
+}
+
+function clampPercent(value: number): number {
+	return Math.max(0, Math.min(100, value));
+}
+
+function parseNumber(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value)) return value;
+	if (typeof value === "string") {
+		const normalized = value.trim().replace(/%$/, "");
+		if (!normalized) return undefined;
+		const parsed = Number(normalized);
+		return Number.isFinite(parsed) ? parsed : undefined;
+	}
+	return undefined;
+}
+
+function normalizePercent(value: unknown): number | undefined {
+	const number = parseNumber(value);
+	if (number === undefined) return undefined;
+	return clampPercent(number);
+}
+
+function firstPercent(record: JsonRecord, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const percent = normalizePercent(record[key]);
+		if (percent !== undefined) return percent;
+	}
+	return undefined;
+}
+
+function firstNumber(record: JsonRecord, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const number = parseNumber(record[key]);
+		if (number !== undefined) return number;
+	}
+	return undefined;
+}
+
+function firstString(record: JsonRecord, keys: string[]): string | undefined {
+	for (const key of keys) {
+		const value = record[key];
+		if (typeof value === "string" && value.trim()) return value.trim();
+	}
+	return undefined;
+}
+
+function extractAccessToken(value: unknown): string | undefined {
+	if (!isRecord(value)) return undefined;
+	const direct = firstString(value, ["access_token", "accessToken", "access"]);
+	if (direct) return direct;
+
+	const tokens = value.tokens;
+	if (isRecord(tokens)) {
+		const token = firstString(tokens, ["access_token", "accessToken", "access"]);
+		if (token) return token;
+	}
+
+	const providerCredential = value[PROVIDER_ID];
+	if (providerCredential && providerCredential !== value) return extractAccessToken(providerCredential);
+	return undefined;
+}
+
+function usageCacheKey(token: string): string {
+	return createHash("sha256").update(token).digest("hex");
+}
+
+function usageErrorMessage(error: unknown): string {
+	return error instanceof Error ? error.message : String(error);
+}
+
+function usageAnsiColor(remainingPercent: number): string {
+	// Use a restrained 256-color palette instead of theme warning/success/error;
+	// some themes render warning as very bright yellow, which makes low quota look louder than high quota.
+	if (remainingPercent < 20) return "\x1b[38;5;167m"; // soft red
+	if (remainingPercent < 50) return "\x1b[38;5;179m"; // muted amber
+	return "\x1b[38;5;150m"; // muted green
+}
+
+function colorAnsi(color: string, text: string): string {
+	return `${color}${text}\x1b[39m`;
+}
+
+function usageBar(remainingPercent: number): { filled: string; empty: string } {
+	const filledCount = Math.round((clampPercent(remainingPercent) / 100) * USAGE_BAR_WIDTH);
+	return {
+		filled: "▰".repeat(filledCount),
+		empty: "▱".repeat(USAGE_BAR_WIDTH - filledCount),
+	};
+}
+
+function formatUsageLimit(ctx: ExtensionContext, limit: UsageLimit): string {
+	const percent = Math.round(clampPercent(limit.remainingPercent));
+	const bar = usageBar(percent);
+	return `${ctx.ui.theme.fg("muted", `${limit.label} `)}${colorAnsi(usageAnsiColor(percent), bar.filled)}${ctx.ui.theme.fg("dim", bar.empty)} ${ctx.ui.theme.fg("muted", `${percent}%`)}`;
+}
+
+function formatUsageLimits(ctx: ExtensionContext, summary: UsageSummary | undefined): string {
+	if (!summary || summary.limits.length === 0) return ctx.ui.theme.fg("dim", "usage ?");
+	return summary.limits.map((limit) => formatUsageLimit(ctx, limit)).join("  ");
+}
+
+function normalizeWindowLabel(text: string): string | undefined {
+	const lower = text.trim().toLowerCase().replace(/[_-]+/g, " ");
+	const hourMatch = lower.match(/(\d+)\s*(?:h|hr|hrs|hour|hours)\b/);
+	if (hourMatch) return `${hourMatch[1]}h`;
+	const dayMatch = lower.match(/(\d+)\s*(?:d|day|days)\b/);
+	if (dayMatch) return `${dayMatch[1]}d`;
+	if (/\bweek(?:ly)?\b/.test(lower)) return "7d";
+	return undefined;
+}
+
+function inferUsageLabel(key: string, raw: unknown): string {
+	if (isRecord(raw)) {
+		const labelText = firstString(raw, ["window", "window_size", "windowSize", "period", "duration", "label", "name", "title", "type"]);
+		if (labelText) {
+			const normalized = normalizeWindowLabel(labelText);
+			if (normalized) return normalized;
+		}
+		const windowMinutes = firstNumber(raw, ["window_minutes", "windowMinutes", "window_mins", "windowMins"]);
+		if (windowMinutes !== undefined && windowMinutes > 0) {
+			if (windowMinutes % 1440 === 0) return `${windowMinutes / 1440}d`;
+			if (windowMinutes % 60 === 0) return `${windowMinutes / 60}h`;
+			return `${windowMinutes}m`;
+		}
+	}
+
+	const normalizedKey = key.toLowerCase();
+	const labelFromKey = normalizeWindowLabel(normalizedKey);
+	if (labelFromKey) return labelFromKey;
+	if (normalizedKey.includes("secondary") || normalizedKey.includes("weekly")) return "7d";
+	if (normalizedKey.includes("primary")) return "5h";
+	return key.replace(/[_-]+/g, " ");
+}
+
+function remainingPercentFromUsage(raw: unknown): number | undefined {
+	if (typeof raw === "number" || typeof raw === "string") {
+		const usedPercent = normalizePercent(raw);
+		return usedPercent === undefined ? undefined : clampPercent(100 - usedPercent);
+	}
+	if (!isRecord(raw)) return undefined;
+
+	const explicitRemaining = firstPercent(raw, ["remaining_percent", "remainingPercentage", "percentage_remaining", "percent_remaining", "remaining_pct", "pct_remaining"]);
+	if (explicitRemaining !== undefined) return explicitRemaining;
+
+	const explicitUsed = firstPercent(raw, ["used_percent", "usedPercentage", "usage_percent", "usagePercentage", "percentage_used", "percent_used", "used_pct", "usage_pct", "pct_used"]);
+	if (explicitUsed !== undefined) return clampPercent(100 - explicitUsed);
+
+	const limit = firstNumber(raw, ["limit", "max", "quota", "total"]);
+	if (limit !== undefined && limit > 0) {
+		const remaining = firstNumber(raw, ["remaining", "available", "left"]);
+		if (remaining !== undefined) return clampPercent((remaining / limit) * 100);
+		const used = firstNumber(raw, ["used", "current", "consumed", "usage", "count"]);
+		if (used !== undefined) return clampPercent(100 - (used / limit) * 100);
+	}
+
+	const fallbackRemaining = firstPercent(raw, ["remaining", "available", "left"]);
+	if (fallbackRemaining !== undefined) return fallbackRemaining;
+
+	const fallbackUsed = firstPercent(raw, ["usage", "used", "current", "percentage", "percent", "pct", "value"]);
+	return fallbackUsed === undefined ? undefined : clampPercent(100 - fallbackUsed);
+}
+
+function pushUsageLimit(limits: UsageLimit[], key: string, raw: unknown): void {
+	const remainingPercent = remainingPercentFromUsage(raw);
+	if (remainingPercent === undefined) return;
+	const label = inferUsageLabel(key, raw);
+	if (limits.some((limit) => limit.label === label)) return;
+	limits.push({ label, remainingPercent, source: key });
+}
+
+function normalizeUsagePayload(payload: unknown): UsageSummary {
+	const root = isRecord(payload) ? payload : {};
+	const rateLimit = isRecord(root.rate_limit) ? root.rate_limit : isRecord(root.rate_limits) ? root.rate_limits : isRecord(root.rateLimit) ? root.rateLimit : root;
+	const planType = firstString(root, ["plan_type", "planType", "plan"]) ?? firstString(rateLimit, ["plan_type", "planType", "plan"]);
+	const limits: UsageLimit[] = [];
+
+	pushUsageLimit(limits, "primary", rateLimit.primary ?? rateLimit.primary_window ?? rateLimit.primaryWindow);
+	pushUsageLimit(limits, "secondary", rateLimit.secondary ?? rateLimit.secondary_window ?? rateLimit.secondaryWindow);
+
+	const additional = root.additional_rate_limits ?? root.additionalRateLimits ?? rateLimit.additional_rate_limits ?? rateLimit.additionalRateLimits;
+	if (Array.isArray(additional)) {
+		additional.forEach((limit, index) => pushUsageLimit(limits, `additional ${index + 1}`, limit));
+	} else if (isRecord(additional)) {
+		for (const [key, limit] of Object.entries(additional)) pushUsageLimit(limits, key, limit);
+	}
+
+	return { planType, limits, fetchedAt: Date.now() };
+}
+
+async function readCodexAuthAccessToken(): Promise<string | undefined> {
+	return extractAccessToken(await readJsonObject(CODEX_AUTH_PATH));
+}
+
+async function fetchUsageSummary(token: string, signal?: AbortSignal): Promise<UsageSummary> {
+	const response = await fetch(LIVE_USAGE_URL, {
+		method: "GET",
+		headers: {
+			Authorization: `Bearer ${token}`,
+			Accept: "application/json",
+		},
+		signal,
+	});
+	if (!response.ok) throw new Error(`usage endpoint returned HTTP ${response.status}`);
+	return normalizeUsagePayload(await response.json());
 }
 
 function tierIcon(tier: ServiceTier): string {
@@ -295,18 +530,81 @@ function completionItems(candidates: string[], prefix: string): AutocompleteItem
 export default function codexManager(pi: ExtensionAPI): void {
 	let tierState: TierState = { enabled: false, value: "priority" };
 	let writeQueue: Promise<void> = Promise.resolve();
+	const usageCache = new Map<string, UsageCacheEntry>();
 
-	async function updateStatus(ctx: ExtensionContext): Promise<void> {
+	async function resolveUsageToken(credential: CodexCredential | undefined, allowAuthFileFallback: boolean): Promise<ResolvedUsageToken | undefined> {
+		const token = extractAccessToken(credential) ?? (allowAuthFileFallback ? await readCodexAuthAccessToken().catch(() => undefined) : undefined);
+		return token ? { token, key: usageCacheKey(token) } : undefined;
+	}
+
+	function fetchUsageWithCache(resolved: ResolvedUsageToken, options?: { refresh?: boolean; signal?: AbortSignal }): Promise<UsageSummary> {
+		const now = Date.now();
+		const cached = usageCache.get(resolved.key);
+		if (!options?.refresh && cached?.summary && cached.expiresAt > now) return Promise.resolve(cached.summary);
+		if (!options?.refresh && cached?.promise) return cached.promise;
+
+		const promise = fetchUsageSummary(resolved.token, options?.signal).then(
+			(summary) => {
+				usageCache.set(resolved.key, { summary, expiresAt: Date.now() + USAGE_CACHE_TTL_MS });
+				return summary;
+			},
+			(error) => {
+				usageCache.set(resolved.key, { error: usageErrorMessage(error), expiresAt: Date.now() + USAGE_ERROR_CACHE_TTL_MS });
+				throw error;
+			},
+		);
+
+		usageCache.set(resolved.key, { ...cached, promise, expiresAt: now + USAGE_CACHE_TTL_MS });
+		return promise;
+	}
+
+	async function getUsageSummary(credential: CodexCredential | undefined, options?: { allowAuthFileFallback?: boolean; refresh?: boolean; signal?: AbortSignal }): Promise<UsageSummary> {
+		const resolved = await resolveUsageToken(credential, options?.allowAuthFileFallback ?? false);
+		if (!resolved) throw new Error("no Codex access token found");
+		return fetchUsageWithCache(resolved, { refresh: options?.refresh, signal: options?.signal });
+	}
+
+	async function getUsageCacheEntry(credential: CodexCredential | undefined, allowAuthFileFallback: boolean): Promise<UsageCacheEntry | undefined> {
+		const resolved = await resolveUsageToken(credential, allowAuthFileFallback);
+		return resolved ? usageCache.get(resolved.key) : undefined;
+	}
+
+	function statusUsageText(ctx: ExtensionContext, entry: UsageCacheEntry | undefined): string | undefined {
+		if (entry?.summary) return formatUsageLimits(ctx, entry.summary);
+		if (entry?.promise) return ctx.ui.theme.fg("dim", "usage …");
+		if (entry?.error) return ctx.ui.theme.fg("dim", "usage ?");
+		return undefined;
+	}
+
+	async function refreshUsageInBackground(ctx: ExtensionContext, credential: CodexCredential | undefined, allowAuthFileFallback: boolean, options?: { refresh?: boolean }): Promise<void> {
+		const resolved = await resolveUsageToken(credential, allowAuthFileFallback).catch(() => undefined);
+		if (!resolved) return;
+		const cached = usageCache.get(resolved.key);
+		if (cached?.promise) return;
+		if (!options?.refresh && (cached?.summary || cached?.error)) return;
+		void fetchUsageWithCache(resolved, { refresh: options?.refresh })
+			.catch(() => undefined)
+			.then(() => updateStatus(ctx).catch(() => undefined));
+	}
+
+	async function updateStatus(ctx: ExtensionContext, options?: { refreshUsage?: boolean }): Promise<void> {
 		if (!ctx.hasUI) return;
 		const active = await readActiveProfile().catch(() => undefined);
 		const current = getCurrentCredentialSafe(ctx);
 		const profile = active ? `codex:${active}` : "codex:?";
-		const parts = [profile, `(${accountLabel(current)})`];
+		await refreshUsageInBackground(ctx, current, true, { refresh: options?.refreshUsage });
+		const parts = [ctx.ui.theme.fg("accent", `${profile} (${accountLabel(current)})`)];
+
+		const usageEntry = await getUsageCacheEntry(current, true).catch(() => undefined);
+		const usageText = statusUsageText(ctx, usageEntry);
+		if (usageText) parts.push(usageText);
+
 		if (tierState.enabled) {
 			const tier = `${tierIcon(tierState.value)}${tierState.value}`;
-			parts.push(supportsServiceTier(ctx) ? tier : `${tier}:inactive`);
+			parts.push(ctx.ui.theme.fg(supportsServiceTier(ctx) ? "accent" : "warning", supportsServiceTier(ctx) ? tier : `${tier}:inactive`));
 		}
-		ctx.ui.setStatus(STATUS_KEY, ctx.ui.theme.fg("accent", parts.join(" ")));
+
+		ctx.ui.setStatus(STATUS_KEY, parts.join("  "));
 	}
 
 	function persistTierState(ctx: ExtensionContext): void {
@@ -348,15 +646,50 @@ export default function codexManager(pi: ExtensionAPI): void {
 		await updateStatus(ctx);
 	}
 
+	async function usageDescription(ctx: ExtensionContext, credential: CodexCredential | undefined, allowAuthFileFallback: boolean): Promise<string> {
+		try {
+			const summary = await getUsageSummary(credential, { allowAuthFileFallback, refresh: true, signal: ctx.signal });
+			const plan = summary.planType ? `${ctx.ui.theme.fg("muted", summary.planType)}  ` : "";
+			return `${plan}${formatUsageLimits(ctx, summary)}`;
+		} catch (error) {
+			return ctx.ui.theme.fg("warning", `usage unavailable (${usageErrorMessage(error)})`);
+		}
+	}
+
 	async function showStatus(ctx: ExtensionContext): Promise<void> {
 		const active = await readActiveProfile().catch(() => undefined);
 		const current = getCurrentCredentialSafe(ctx);
-		const profileCount = listProfileNames().length;
+		const names = listProfileNames();
 		const lines = [
-			`Profile: ${active ? `'${active}'` : "no active profile marker"} (${accountLabel(current)}), ${profileCount} saved`,
+			ctx.ui.theme.fg("accent", "Codex status"),
+			`Current: ${active ? `'${active}'` : "no active profile marker"} (${accountLabel(current)}), ${names.length} saved`,
 			`Tier: ${describeTier(ctx)}`,
 		];
+
+		if (names.length === 0) {
+			lines.push("", `Usage: ${await usageDescription(ctx, current, true)}`);
+			notify(ctx, lines.join("\n"), "info");
+			await updateStatus(ctx);
+			return;
+		}
+
+		lines.push("", "Profiles:");
+		for (const name of names) {
+			try {
+				const credential = await readProfile(name);
+				const markers = [name === active ? "active" : undefined, sameKnownAccount(credential, current) ? "current" : undefined]
+					.filter(Boolean)
+					.join(", ");
+				const prefix = name === active ? ctx.ui.theme.fg("success", "*") : " ";
+				const usage = await usageDescription(ctx, credential, sameKnownAccount(credential, current));
+				lines.push(`${prefix} ${ctx.ui.theme.fg("accent", name)}: ${accountLabel(credential)}${markers ? ` [${markers}]` : ""}  ${usage}`);
+			} catch (error) {
+				lines.push(`  ${name}: ${ctx.ui.theme.fg("error", `invalid (${usageErrorMessage(error)})`)}`);
+			}
+		}
+
 		notify(ctx, lines.join("\n"), "info");
+		await updateStatus(ctx);
 	}
 
 	async function handleProfileCommand(tokens: string[], ctx: ExtensionCommandContext): Promise<void> {
@@ -519,6 +852,10 @@ export default function codexManager(pi: ExtensionAPI): void {
 
 	pi.on("model_select", async (_event, ctx) => {
 		await updateStatus(ctx);
+	});
+
+	pi.on("agent_end", async (_event, ctx) => {
+		await updateStatus(ctx, { refreshUsage: true });
 	});
 
 	pi.on("before_provider_request", (event, ctx) => {

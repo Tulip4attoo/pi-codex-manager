@@ -1,14 +1,14 @@
 # pi-codex-manager
 
-Manage OpenAI Codex accounts and **Fast mode** from one pi command: `/codex`.
+Manage OpenAI Codex accounts, live usage, and **Fast mode** from one pi command: `/codex`.
 
-Switch easily between multiple Codex accounts without logging out, logging back in, and repeating the OAuth flow every time one account hits quota. Jump between them with `/codex profile switch <name>`.
+Switch easily between multiple Codex accounts without logging out, logging back in, and repeating the OAuth flow every time one account hits quota. Jump between them with `/codex profile switch <name>`, and see remaining 5h/7d quota in the footer and `/codex status`.
 
 This extension replaces separate Codex helpers such as account switching and fast/service-tier toggling. It intentionally keeps the command space small by registering only `/codex`.
 
 ## Demo
 
-![pi-codex-manager demo](./media/codex_manager_0.1.1.gif)
+![pi-codex-manager demo](./media/codex_manager_0.2.0.gif)
 
 ## Install from GitHub
 
@@ -64,6 +64,18 @@ List saved profiles:
 
 ```text
 /codex profile list
+```
+
+Show live usage for the current/saved profiles:
+
+```text
+/codex status
+```
+
+The footer also shows remaining quota for the active account, for example:
+
+```text
+codex:a (account …73b9672b)  5h ▰▰▰▰▱▱▱▱ 50%  7d ▰▰▰▰▰▰▱▱ 75%
 ```
 
 Show the current profile/account:
@@ -155,5 +167,6 @@ Project settings can override global settings through:
 
 - Only the `openai-codex` auth entry is changed when switching profiles; other `auth.json` credentials are kept.
 - If you use `auto` / `websocket-cached` transport, run `/new` after switching profiles when you want a fresh cached WebSocket/context.
-- OAuth tokens are sensitive. Do not commit `~/.pi/agent/auth.json` or `~/.pi/agent/codex-profiles/`.
+- OAuth tokens are sensitive. Do not commit `~/.pi/agent/auth.json`, `~/.pi/agent/codex-profiles/`, or `~/.codex/auth.json`.
+- Live usage is read from ChatGPT's `https://chatgpt.com/backend-api/wham/usage` endpoint with the active Codex access token; `/codex status` and each completed agent turn refresh it.
 - The profile switcher uses pi internal auth access: `ctx.modelRegistry.authStorage`, so future pi updates could require changes.
