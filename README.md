@@ -72,11 +72,13 @@ Show live usage for the current/saved profiles:
 /codex status
 ```
 
-The footer also shows remaining quota for the active account, for example:
+The footer also shows remaining quota and reset countdowns for the active account, refreshed about once a minute, for example:
 
 ```text
-codex:a (account …73b9672b)  5h ▰▰▰▰▱▱▱▱ 50%  7d ▰▰▰▰▰▰▱▱ 75%
+codex:a (account …73b9672b)  2h13m ▰▰▰▰▱▱▱▱ 50%  5d8h ▰▰▰▰▰▰▱▱ 75%
 ```
+
+`/codex status` uses the same compact quota format as the footer.
 
 Show the current profile/account:
 
@@ -168,5 +170,5 @@ Project settings can override global settings through:
 - Only the `openai-codex` auth entry is changed when switching profiles; other `auth.json` credentials are kept.
 - If you use `auto` / `websocket-cached` transport, run `/new` after switching profiles when you want a fresh cached WebSocket/context.
 - OAuth tokens are sensitive. Do not commit `~/.pi/agent/auth.json`, `~/.pi/agent/codex-profiles/`, or `~/.codex/auth.json`.
-- Live usage is read from ChatGPT's `https://chatgpt.com/backend-api/wham/usage` endpoint with the active Codex access token; `/codex status` and each completed agent turn refresh it.
+- Live usage and reset countdowns are read from ChatGPT's `https://chatgpt.com/backend-api/wham/usage` endpoint with the active Codex access token; `/codex status` and each completed agent turn refresh it.
 - The profile switcher uses pi internal auth access: `ctx.modelRegistry.authStorage`, so future pi updates could require changes.

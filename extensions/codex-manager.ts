@@ -19,6 +19,7 @@ const CODEX_AUTH_PATH = join(homedir(), ".codex", "auth.json");
 const LIVE_USAGE_URL = "https://chatgpt.com/backend-api/wham/usage";
 const USAGE_CACHE_TTL_MS = 60_000;
 const USAGE_ERROR_CACHE_TTL_MS = 15_000;
+const STATUS_REFRESH_INTERVAL_MS = 60_000;
 const USAGE_BAR_WIDTH = 8;
 
 const SERVICE_TIERS = ["scale", "priority"] as const;
@@ -41,6 +42,7 @@ type TierState = {
 type UsageLimit = {
 	label: string;
 	remainingPercent: number;
+	resetAtMs?: number;
 	source: string;
 };
 
@@ -142,6 +144,76 @@ function firstString(record: JsonRecord, keys: string[]): string | undefined {
 	return undefined;
 }
 
+function parseTimestampMs(value: unknown): number | undefined {
+	if (typeof value === "number" && Number.isFinite(value) && value > 0) {
+		return value < 10_000_000_000 ? value * 1000 : value;
+	}
+	if (typeof value !== "string") return undefined;
+	const trimmed = value.trim();
+	if (!trimmed) return undefined;
+	const numeric = Number(trimmed);
+	if (Number.isFinite(numeric) && numeric > 0) return numeric < 10_000_000_000 ? numeric * 1000 : numeric;
+	const parsed = Date.parse(trimmed);
+	return Number.isFinite(parsed) ? parsed : undefined;
+}
+
+function firstTimestampMs(record: JsonRecord, keys: string[]): number | undefined {
+	for (const key of keys) {
+		const timestamp = parseTimestampMs(record[key]);
+		if (timestamp !== undefined) return timestamp;
+	}
+	return undefined;
+}
+
+type DurationUnit = "milliseconds" | "seconds" | "minutes" | "hours" | "days";
+
+function durationUnitMs(unit: DurationUnit): number {
+	switch (unit) {
+		case "milliseconds":
+			return 1;
+		case "seconds":
+			return 1000;
+		case "minutes":
+			return 60_000;
+		case "hours":
+			return 3_600_000;
+		case "days":
+			return 86_400_000;
+	}
+}
+
+function parseDurationMs(value: unknown, defaultUnit: DurationUnit): number | undefined {
+	const number = parseNumber(value);
+	if (number !== undefined && number >= 0) return number * durationUnitMs(defaultUnit);
+	if (typeof value !== "string") return undefined;
+	const text = value.trim().toLowerCase();
+	if (!text) return undefined;
+
+	let total = 0;
+	let matched = false;
+	const pattern = /(\d+(?:\.\d+)?)\s*(ms|millisecond|milliseconds|s|sec|secs|second|seconds|m|min|mins|minute|minutes|h|hr|hrs|hour|hours|d|day|days)\b/g;
+	for (const match of text.matchAll(pattern)) {
+		const amount = Number(match[1]);
+		if (!Number.isFinite(amount)) continue;
+		matched = true;
+		const unit = match[2];
+		if (unit === "ms" || unit.startsWith("millisecond")) total += amount;
+		else if (unit === "s" || unit.startsWith("sec")) total += amount * 1000;
+		else if (unit === "m" || unit.startsWith("min")) total += amount * 60_000;
+		else if (unit === "h" || unit.startsWith("hr") || unit.startsWith("hour")) total += amount * 3_600_000;
+		else if (unit === "d" || unit.startsWith("day")) total += amount * 86_400_000;
+	}
+	return matched ? total : undefined;
+}
+
+function firstDurationMs(record: JsonRecord, candidates: Array<[string, DurationUnit]>): number | undefined {
+	for (const [key, unit] of candidates) {
+		const duration = parseDurationMs(record[key], unit);
+		if (duration !== undefined) return duration;
+	}
+	return undefined;
+}
+
 function extractAccessToken(value: unknown): string | undefined {
 	if (!isRecord(value)) return undefined;
 	const direct = firstString(value, ["access_token", "accessToken", "access"]);
@@ -186,15 +258,35 @@ function usageBar(remainingPercent: number): { filled: string; empty: string } {
 	};
 }
 
-function formatUsageLimit(ctx: ExtensionContext, limit: UsageLimit): string {
-	const percent = Math.round(clampPercent(limit.remainingPercent));
-	const bar = usageBar(percent);
-	return `${ctx.ui.theme.fg("muted", `${limit.label} `)}${colorAnsi(usageAnsiColor(percent), bar.filled)}${ctx.ui.theme.fg("dim", bar.empty)} ${ctx.ui.theme.fg("muted", `${percent}%`)}`;
+function formatDurationCompact(durationMs: number): string {
+	const totalSeconds = Math.max(0, Math.ceil(durationMs / 1000));
+	const days = Math.floor(totalSeconds / 86_400);
+	const hours = Math.floor((totalSeconds % 86_400) / 3_600);
+	const minutes = Math.floor((totalSeconds % 3_600) / 60);
+	const seconds = totalSeconds % 60;
+	if (days > 0) return `${days}d${hours > 0 ? `${hours}h` : ""}`;
+	if (hours > 0) return `${hours}h${minutes > 0 ? `${minutes}m` : ""}`;
+	if (minutes > 0) return `${minutes}m`;
+	return `${seconds}s`;
 }
 
-function formatUsageLimits(ctx: ExtensionContext, summary: UsageSummary | undefined): string {
+function resetText(resetAtMs: number | undefined): string | undefined {
+	return resetAtMs === undefined ? undefined : formatDurationCompact(resetAtMs - Date.now());
+}
+
+function formatUsageLimit(ctx: ExtensionContext, limit: UsageLimit, options?: { compact?: boolean }): string {
+	const percent = Math.round(clampPercent(limit.remainingPercent));
+	const bar = usageBar(percent);
+	const reset = resetText(limit.resetAtMs);
+	const prefix = options?.compact
+		? ctx.ui.theme.fg("muted", `${reset ?? limit.label} `)
+		: `${ctx.ui.theme.fg("muted", limit.label)}${reset ? ` ${ctx.ui.theme.fg("dim", `↻ ${reset}`)}` : ""}${ctx.ui.theme.fg("muted", " ")}`;
+	return `${prefix}${colorAnsi(usageAnsiColor(percent), bar.filled)}${ctx.ui.theme.fg("dim", bar.empty)} ${ctx.ui.theme.fg("muted", `${percent}%`)}`;
+}
+
+function formatUsageLimits(ctx: ExtensionContext, summary: UsageSummary | undefined, options?: { compact?: boolean }): string {
 	if (!summary || summary.limits.length === 0) return ctx.ui.theme.fg("dim", "usage ?");
-	return summary.limits.map((limit) => formatUsageLimit(ctx, limit)).join("  ");
+	return summary.limits.map((limit) => formatUsageLimit(ctx, limit, options)).join(options?.compact ? "  " : "    ");
 }
 
 function normalizeWindowLabel(text: string): string | undefined {
@@ -230,6 +322,71 @@ function inferUsageLabel(key: string, raw: unknown): string {
 	return key.replace(/[_-]+/g, " ");
 }
 
+function resetAtFromUsage(raw: unknown, now = Date.now()): number | undefined {
+	if (!isRecord(raw)) return undefined;
+
+	const explicitResetAt = firstTimestampMs(raw, [
+		"reset_at",
+		"resetAt",
+		"resets_at",
+		"resetsAt",
+		"next_reset_at",
+		"nextResetAt",
+		"reset_time",
+		"resetTime",
+		"reset_date",
+		"resetDate",
+		"expires_at",
+		"expiresAt",
+		"end_time",
+		"endTime",
+		"window_end",
+		"windowEnd",
+	]);
+	if (explicitResetAt !== undefined) return explicitResetAt;
+
+	const resetAfterMs = firstDurationMs(raw, [
+		["reset_after_ms", "milliseconds"],
+		["resetAfterMs", "milliseconds"],
+		["reset_in_ms", "milliseconds"],
+		["resetInMs", "milliseconds"],
+		["reset_after_seconds", "seconds"],
+		["resetAfterSeconds", "seconds"],
+		["reset_in_seconds", "seconds"],
+		["resetInSeconds", "seconds"],
+		["resets_in_seconds", "seconds"],
+		["resetsInSeconds", "seconds"],
+		["seconds_until_reset", "seconds"],
+		["secondsUntilReset", "seconds"],
+		["time_until_reset", "seconds"],
+		["timeUntilReset", "seconds"],
+		["remaining_seconds", "seconds"],
+		["remainingSeconds", "seconds"],
+		["reset_after", "seconds"],
+		["resetAfter", "seconds"],
+		["reset_in", "seconds"],
+		["resetIn", "seconds"],
+		["resets_in", "seconds"],
+		["resetsIn", "seconds"],
+	]);
+	if (resetAfterMs !== undefined) return now + resetAfterMs;
+
+	const windowStart = firstTimestampMs(raw, ["window_start", "windowStart", "start_time", "startTime", "started_at", "startedAt"]);
+	const windowDurationMs = firstDurationMs(raw, [
+		["window_ms", "milliseconds"],
+		["windowMs", "milliseconds"],
+		["window_seconds", "seconds"],
+		["windowSeconds", "seconds"],
+		["window_minutes", "minutes"],
+		["windowMinutes", "minutes"],
+		["window_hours", "hours"],
+		["windowHours", "hours"],
+		["window_days", "days"],
+		["windowDays", "days"],
+	]);
+	return windowStart !== undefined && windowDurationMs !== undefined ? windowStart + windowDurationMs : undefined;
+}
+
 function remainingPercentFromUsage(raw: unknown): number | undefined {
 	if (typeof raw === "number" || typeof raw === "string") {
 		const usedPercent = normalizePercent(raw);
@@ -262,8 +419,13 @@ function pushUsageLimit(limits: UsageLimit[], key: string, raw: unknown): void {
 	const remainingPercent = remainingPercentFromUsage(raw);
 	if (remainingPercent === undefined) return;
 	const label = inferUsageLabel(key, raw);
-	if (limits.some((limit) => limit.label === label)) return;
-	limits.push({ label, remainingPercent, source: key });
+	const resetAtMs = resetAtFromUsage(raw);
+	const existing = limits.find((limit) => limit.label === label);
+	if (existing) {
+		if (existing.resetAtMs === undefined && resetAtMs !== undefined) existing.resetAtMs = resetAtMs;
+		return;
+	}
+	limits.push({ label, remainingPercent, resetAtMs, source: key });
 }
 
 function normalizeUsagePayload(payload: unknown): UsageSummary {
@@ -530,6 +692,8 @@ function completionItems(candidates: string[], prefix: string): AutocompleteItem
 export default function codexManager(pi: ExtensionAPI): void {
 	let tierState: TierState = { enabled: false, value: "priority" };
 	let writeQueue: Promise<void> = Promise.resolve();
+	let statusRefreshTimer: ReturnType<typeof setInterval> | undefined;
+	let latestStatusCtx: ExtensionContext | undefined;
 	const usageCache = new Map<string, UsageCacheEntry>();
 
 	async function resolveUsageToken(credential: CodexCredential | undefined, allowAuthFileFallback: boolean): Promise<ResolvedUsageToken | undefined> {
@@ -570,18 +734,35 @@ export default function codexManager(pi: ExtensionAPI): void {
 	}
 
 	function statusUsageText(ctx: ExtensionContext, entry: UsageCacheEntry | undefined): string | undefined {
-		if (entry?.summary) return formatUsageLimits(ctx, entry.summary);
+		if (entry?.summary) return formatUsageLimits(ctx, entry.summary, { compact: true });
 		if (entry?.promise) return ctx.ui.theme.fg("dim", "usage …");
 		if (entry?.error) return ctx.ui.theme.fg("dim", "usage ?");
 		return undefined;
+	}
+
+	function startStatusRefreshTimer(ctx: ExtensionContext): void {
+		latestStatusCtx = ctx;
+		if (statusRefreshTimer) return;
+		statusRefreshTimer = setInterval(() => {
+			if (!latestStatusCtx) return;
+			void updateStatus(latestStatusCtx).catch(() => undefined);
+		}, STATUS_REFRESH_INTERVAL_MS);
+		(statusRefreshTimer as { unref?: () => void }).unref?.();
+	}
+
+	function stopStatusRefreshTimer(): void {
+		if (statusRefreshTimer) clearInterval(statusRefreshTimer);
+		statusRefreshTimer = undefined;
+		latestStatusCtx = undefined;
 	}
 
 	async function refreshUsageInBackground(ctx: ExtensionContext, credential: CodexCredential | undefined, allowAuthFileFallback: boolean, options?: { refresh?: boolean }): Promise<void> {
 		const resolved = await resolveUsageToken(credential, allowAuthFileFallback).catch(() => undefined);
 		if (!resolved) return;
 		const cached = usageCache.get(resolved.key);
+		const now = Date.now();
 		if (cached?.promise) return;
-		if (!options?.refresh && (cached?.summary || cached?.error)) return;
+		if (!options?.refresh && cached && cached.expiresAt > now && (cached.summary || cached.error)) return;
 		void fetchUsageWithCache(resolved, { refresh: options?.refresh })
 			.catch(() => undefined)
 			.then(() => updateStatus(ctx).catch(() => undefined));
@@ -589,6 +770,7 @@ export default function codexManager(pi: ExtensionAPI): void {
 
 	async function updateStatus(ctx: ExtensionContext, options?: { refreshUsage?: boolean }): Promise<void> {
 		if (!ctx.hasUI) return;
+		startStatusRefreshTimer(ctx);
 		const active = await readActiveProfile().catch(() => undefined);
 		const current = getCurrentCredentialSafe(ctx);
 		const profile = active ? `codex:${active}` : "codex:?";
@@ -649,8 +831,7 @@ export default function codexManager(pi: ExtensionAPI): void {
 	async function usageDescription(ctx: ExtensionContext, credential: CodexCredential | undefined, allowAuthFileFallback: boolean): Promise<string> {
 		try {
 			const summary = await getUsageSummary(credential, { allowAuthFileFallback, refresh: true, signal: ctx.signal });
-			const plan = summary.planType ? `${ctx.ui.theme.fg("muted", summary.planType)}  ` : "";
-			return `${plan}${formatUsageLimits(ctx, summary)}`;
+			return formatUsageLimits(ctx, summary, { compact: true });
 		} catch (error) {
 			return ctx.ui.theme.fg("warning", `usage unavailable (${usageErrorMessage(error)})`);
 		}
@@ -847,7 +1028,12 @@ export default function codexManager(pi: ExtensionAPI): void {
 	});
 
 	pi.on("session_start", async (_event, ctx) => {
+		startStatusRefreshTimer(ctx);
 		await reloadTierState(ctx);
+	});
+
+	pi.on("session_shutdown", () => {
+		stopStatusRefreshTimer();
 	});
 
 	pi.on("model_select", async (_event, ctx) => {
