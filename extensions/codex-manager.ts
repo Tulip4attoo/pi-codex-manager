@@ -1,5 +1,5 @@
-import type { AutocompleteItem } from "@mariozechner/pi-tui";
-import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@mariozechner/pi-coding-agent";
+import type { AutocompleteItem } from "@earendil-works/pi-tui";
+import type { ExtensionAPI, ExtensionCommandContext, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { chmod, mkdir, readFile, rename, writeFile } from "node:fs/promises";
 import { existsSync, readdirSync } from "node:fs";
 import { createHash } from "node:crypto";
